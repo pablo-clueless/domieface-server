@@ -2,6 +2,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -71,25 +72,72 @@ type SelfPingConfig struct {
 	Timeout  time.Duration
 }
 
-// Load reads configuration from the environment, applying defaults that are
-// safe for local development and failing fast on anything that must be set
-// explicitly in production.
+// Environment names. Anything that is not development is treated as
+// production, so a typo fails safe rather than unlocking dev defaults.
+const (
+	EnvironmentDevelopment = "development"
+	EnvironmentProduction  = "production"
+)
+
+// missingVar is one required setting that was not supplied.
+type missingVar struct {
+	key  string
+	help string
+}
+
+// Load reads configuration from the environment.
+//
+// ENVIRONMENT decides how forgiving this is, and it defaults to production on
+// purpose. Convenience defaults -- a localhost database, a known JWT signing
+// key, MinIO's well-known credentials -- are only ever applied when
+// ENVIRONMENT=development is set explicitly.
+//
+// Defaulting the other way round is how a deployment ends up signing real
+// tokens with a secret that is published in this repository. A missing variable
+// must stop the process, not quietly downgrade it.
 func Load() (*Config, error) {
+	environment := env("ENVIRONMENT", EnvironmentProduction)
+	development := environment == EnvironmentDevelopment
+
+	// missing accumulates everything unset so one failed boot reports every
+	// problem, rather than making the operator redeploy once per variable.
+	var missing []missingVar
+
+	// required returns the environment value, falling back to devDefault only
+	// in development and otherwise recording the omission.
+	required := func(key, devDefault, help string) string {
+		if value := os.Getenv(key); value != "" {
+			return value
+		}
+		if development {
+			return devDefault
+		}
+		missing = append(missing, missingVar{key: key, help: help})
+		return ""
+	}
+
 	cfg := &Config{
-		Addr:            ":" + env("PORT", "8080"),
-		DatabaseURL:     env("DATABASE_URL", "postgres://domieface:domieface@localhost:5432/domieface?sslmode=disable"),
-		Environment:     env("ENVIRONMENT", "development"),
+		Addr:        ":" + env("PORT", "8080"),
+		Environment: environment,
+		DatabaseURL: required("DATABASE_URL",
+			"postgres://domieface:domieface@localhost:5432/domieface?sslmode=disable",
+			"Postgres connection string, e.g. postgres://user:pass@host:5432/db?sslmode=require"),
 		AccessTokenTTL:  15 * time.Minute,
 		RefreshTokenTTL: 30 * 24 * time.Hour,
 		UploadGCAfter:   24 * time.Hour,
 		Storage: StorageConfig{
-			Endpoint:      env("S3_ENDPOINT", "http://localhost:9000"),
-			Region:        env("S3_REGION", "us-east-1"),
-			Bucket:        env("S3_BUCKET", "domieface"),
-			AccessKey:     env("S3_ACCESS_KEY_ID", "minioadmin"),
-			SecretKey:     env("S3_SECRET_ACCESS_KEY", "minioadmin"),
-			PublicBaseURL: env("S3_PUBLIC_BASE_URL", "http://localhost:9000/domieface"),
-			PresignTTL:    15 * time.Minute,
+			// Endpoint is genuinely optional: empty means real AWS S3.
+			Endpoint: env("S3_ENDPOINT", devOnly(development, "http://localhost:9000")),
+			Region:   env("S3_REGION", "us-east-1"),
+			Bucket: required("S3_BUCKET", "domieface",
+				"object storage bucket for uploaded images"),
+			AccessKey: required("S3_ACCESS_KEY_ID", "minioadmin",
+				"object storage access key"),
+			SecretKey: required("S3_SECRET_ACCESS_KEY", "minioadmin",
+				"object storage secret key"),
+			PublicBaseURL: required("S3_PUBLIC_BASE_URL", "http://localhost:9000/domieface",
+				"public base URL images are read back from; must be reachable from the client device"),
+			PresignTTL: 15 * time.Minute,
 		},
 		DocsEnabled: envBool("DOCS_ENABLED", true),
 		SelfPing: SelfPingConfig{
@@ -105,21 +153,27 @@ func Load() (*Config, error) {
 		TrustProxyHeader:    envBool("TRUST_PROXY_HEADER", false),
 	}
 
-	cfg.Storage.UsePathStyle = envBool("S3_USE_PATH_STYLE", true)
+	cfg.Storage.UsePathStyle = envBool("S3_USE_PATH_STYLE", development)
 
 	secret := os.Getenv("JWT_SECRET")
-	if secret == "" {
-		if cfg.IsProduction() {
-			return nil, fmt.Errorf("JWT_SECRET must be set when ENVIRONMENT=production")
-		}
-		// Deterministic dev secret so restarting the server does not invalidate
-		// every access token a client is holding.
+	switch {
+	case secret == "" && development:
+		// Deterministic, so restarting the server does not invalidate every
+		// access token a client is holding.
 		secret = "insecure-development-secret-do-not-use-in-production"
-	}
-	if len(secret) < 32 && cfg.IsProduction() {
-		return nil, fmt.Errorf("JWT_SECRET must be at least 32 characters")
+	case secret == "":
+		missing = append(missing, missingVar{
+			key:  "JWT_SECRET",
+			help: "at least 32 characters; generate with: openssl rand -base64 48",
+		})
+	case len(secret) < 32 && !development:
+		return nil, fmt.Errorf("JWT_SECRET must be at least 32 characters, got %d", len(secret))
 	}
 	cfg.JWTSecret = []byte(secret)
+
+	if len(missing) > 0 {
+		return nil, missingError(environment, missing)
+	}
 
 	var err error
 	if cfg.AccessTokenTTL, err = envDuration("ACCESS_TOKEN_TTL", cfg.AccessTokenTTL); err != nil {
@@ -146,7 +200,6 @@ func Load() (*Config, error) {
 	if cfg.AuthRateLimitBurst, err = envInt("AUTH_RATE_LIMIT_BURST", cfg.AuthRateLimitBurst); err != nil {
 		return nil, err
 	}
-
 	if cfg.SelfPing.Interval, err = envDuration("SELF_PING_INTERVAL", cfg.SelfPing.Interval); err != nil {
 		return nil, err
 	}
@@ -154,24 +207,57 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	if cfg.SelfPing.URL == "" {
-		// Default to our own listener. Note the caveat on SelfPingConfig: this
-		// keeps the process warm but does not stop a PaaS idling it.
-		host, port, splitErr := net.SplitHostPort(cfg.Addr)
-		if splitErr != nil {
-			return nil, fmt.Errorf("PORT: %w", splitErr)
+		cfg.SelfPing.URL, err = defaultSelfPingURL(cfg.Addr)
+		if err != nil {
+			return nil, err
 		}
-		if host == "" {
-			host = "localhost"
-		}
-		cfg.SelfPing.URL = "http://" + net.JoinHostPort(host, port) + "/healthz"
 	}
 
-	if cfg.Storage.Bucket == "" {
-		return nil, fmt.Errorf("S3_BUCKET must be set")
-	}
 	cfg.Storage.PublicBaseURL = strings.TrimRight(cfg.Storage.PublicBaseURL, "/")
 
 	return cfg, nil
+}
+
+// devOnly returns value in development and the empty string otherwise, for
+// settings whose local default would be actively wrong in production.
+func devOnly(development bool, value string) string {
+	if development {
+		return value
+	}
+	return ""
+}
+
+// missingError reports every unset variable at once, with enough detail to fix
+// them without reading the source.
+func missingError(environment string, missing []missingVar) error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "missing required configuration (ENVIRONMENT=%s):\n", environment)
+	for _, m := range missing {
+		fmt.Fprintf(&b, "  %-22s %s\n", m.key, m.help)
+	}
+	b.WriteString("\nSet these in the service environment. " +
+		"For a local machine, set ENVIRONMENT=development to use local defaults instead.")
+	return errors.New(b.String())
+}
+
+// defaultSelfPingURL picks what the keep-alive should request when
+// SELF_PING_URL is not set.
+func defaultSelfPingURL(addr string) (string, error) {
+	// Render publishes the service's own public URL. Using it means the request
+	// leaves and re-enters through the platform router, which is what stops the
+	// instance being idled; a loopback request never reaches the router.
+	if external := os.Getenv("RENDER_EXTERNAL_URL"); external != "" {
+		return strings.TrimRight(external, "/") + "/healthz", nil
+	}
+
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", fmt.Errorf("PORT: %w", err)
+	}
+	if host == "" {
+		host = "localhost"
+	}
+	return "http://" + net.JoinHostPort(host, port) + "/healthz", nil
 }
 
 // IsProduction reports whether the server is running with production guardrails.

@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -23,17 +24,22 @@ import (
 )
 
 func main() {
-	if err := run(); err != nil {
+	cfg, err := config.Load()
+	if err != nil {
+		// Printed plainly rather than through slog. This is the first thing a
+		// human reads in a failed deploy log, and structured logging would
+		// escape its newlines and collapse the whole thing onto one line.
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	if err := run(cfg); err != nil {
 		slog.Error("server exited with an error", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
-	cfg, err := config.Load()
-	if err != nil {
-		return err
-	}
+func run(cfg *config.Config) error {
 	setupLogging(cfg)
 
 	// Cancelled on SIGINT or SIGTERM; every background goroutine watches it.

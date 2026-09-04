@@ -173,6 +173,11 @@ The server requests its own `/healthz` every 10 minutes (`SELF_PING_INTERVAL`), 
 keeps the process and its Postgres connection pool warm rather than letting idle
 connections get dropped and reconnected on the first real request.
 
+On Render the target defaults to `RENDER_EXTERNAL_URL`, so the request leaves and
+re-enters through the platform router, which is the only version of this that can
+affect idling. Even so, treat it as best-effort: if staying awake matters, drive it
+from an external cron rather than from the instance that is trying not to sleep.
+
 Be clear about what this does not do: **pinging the loopback address will not stop a
 platform-as-a-service idling the instance.** Those platforms decide based on traffic
 arriving at their edge router, and a request the container makes to itself never gets
@@ -184,6 +189,45 @@ SELF_PING_URL=https://your-service.example.com/healthz
 ```
 
 `SELF_PING_ENABLED=false` turns it off.
+
+## Deploying
+
+[render.yaml](render.yaml) is a Render blueprint covering the whole stack. Deploying
+anywhere else needs the same variables.
+
+**`ENVIRONMENT` defaults to `production`, and only the exact string `development`
+unlocks the local fallbacks.** That direction is deliberate. The fallbacks include a
+JWT signing key committed to this repository, so defaulting to development would let a
+deployment that forgot one variable sign real tokens with a published secret — anyone
+could then forge a token for any account. A missing variable stops the boot instead,
+naming everything that is missing at once:
+
+```
+missing required configuration (ENVIRONMENT=production):
+  DATABASE_URL           Postgres connection string, e.g. postgres://user:pass@host:5432/db?sslmode=require
+  JWT_SECRET             at least 32 characters; generate with: openssl rand -base64 48
+  ...
+```
+
+Two settings are easy to get wrong and do not announce themselves:
+
+- **`TRUST_PROXY_HEADER=true` on any PaaS.** Every request arrives through the
+  platform's proxy, so with this off the rate limiter sees a single client address for
+  the entire internet and throttles all your users against one shared budget. It is
+  off by default because trusting `X-Forwarded-For` when the server is directly
+  reachable lets any caller forge an address and walk past the limiter.
+- **`S3_PUBLIC_BASE_URL` must be reachable from the phone**, not just from the server.
+  It is baked into every `avatarUrl` and `imageUrl`.
+
+Render has no object storage, so the `S3_*` variables point at S3, Cloudflare R2,
+Backblaze B2 or similar. The server refuses to start without them rather than
+accepting uploads and failing on the first presign.
+
+Set the health check path to `/healthz`, not `/readyz`. Liveness touches no dependency,
+so a database blip will not have the platform recycle otherwise-healthy instances.
+
+On the free plan: the web service sleeps after ~15 minutes without inbound traffic, and
+the Postgres instance is deleted after 30 days.
 
 ## Configuration
 

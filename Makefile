@@ -36,6 +36,10 @@ endif
 # server process.
 export
 
+# Local development uses the built-in fallbacks. Anything else, including an
+# unset value, is treated as production and must be configured explicitly.
+ENVIRONMENT ?= development
+
 # Port the API listens on. Change it if 8080 is already taken -- a local Apache
 # or another dev server is the usual culprit.
 PORT ?= 8080

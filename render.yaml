@@ -1,0 +1,88 @@
+# Render blueprint. Create the service from this with Blueprints > New, or use
+# it as a checklist if you configured the service by hand in the dashboard.
+#
+# Two variables below are the ones that actually bite:
+#
+#   DATABASE_URL        Without it the server fails at boot. It no longer falls
+#                       back to localhost, so the error names the variable
+#                       instead of reporting "connection refused" at 127.0.0.1.
+#
+#   TRUST_PROXY_HEADER  Must be true here. Every request arrives through
+#                       Render's proxy, so without it the rate limiter sees one
+#                       client address for the whole internet and throttles all
+#                       your users against a single shared budget.
+
+services:
+  - type: web
+    name: domieface-server
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: oregon
+
+    # Liveness only: it touches no dependency, so Render will not recycle the
+    # instance during a database blip. /readyz is the one that reports
+    # dependencies, and it is not the right probe for this.
+    healthCheckPath: /healthz
+
+    envVars:
+      # Turns off the local development fallbacks. Without it the server would
+      # refuse to start anyway, which is the intended behaviour.
+      - key: ENVIRONMENT
+        value: production
+
+      - key: DATABASE_URL
+        fromDatabase:
+          name: domieface-db
+          property: connectionString
+
+      # Render generates this once and keeps it. Rotating it signs out every
+      # user, because it invalidates every access token in flight.
+      - key: JWT_SECRET
+        generateValue: true
+
+      # See the note at the top. Getting this wrong is not a crash, it is a
+      # service that rate-limits everybody as though they were one caller.
+      - key: TRUST_PROXY_HEADER
+        value: "true"
+
+      # Render has no object storage, so these point at S3, Cloudflare R2,
+      # Backblaze B2 or similar. sync: false means "set in the dashboard, do not
+      # commit". The server refuses to start without them rather than failing
+      # later on the first upload.
+      - key: S3_BUCKET
+        sync: false
+      - key: S3_REGION
+        sync: false
+      - key: S3_ACCESS_KEY_ID
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false
+      # Where images are read back from. Must be reachable from the phone, not
+      # just from this service.
+      - key: S3_PUBLIC_BASE_URL
+        sync: false
+      # Only for an S3-compatible provider that is not AWS (R2, B2, MinIO).
+      # Leave unset for real AWS S3.
+      - key: S3_ENDPOINT
+        sync: false
+
+      # The keep-alive defaults to RENDER_EXTERNAL_URL, which Render injects, so
+      # the request leaves and re-enters through the router. See the README on
+      # why a loopback ping cannot prevent idling -- and why even this is not a
+      # guarantee on the free plan.
+      - key: SELF_PING_ENABLED
+        value: "true"
+
+databases:
+  - name: domieface-db
+    plan: free
+    databaseName: domieface
+    user: domieface
+
+# Free plan caveats, so they are not a surprise later:
+#
+#   - A free web service sleeps after ~15 minutes without inbound traffic, and
+#     the first request afterwards waits for a cold start.
+#   - A free Postgres instance is deleted after 30 days. Move to a paid plan
+#     before you have data you care about.
