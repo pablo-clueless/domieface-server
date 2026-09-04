@@ -1,0 +1,33 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Read the version from go.mod rather than pinning it here, so the
+          # two cannot drift apart.
+          go-version-file: go.mod
+          cache: true
+
+      # `make check` is fmt-check, vet, build and test — the same command, in
+      # the same order, that a developer runs locally.
+      - name: Check
+        run: make check
+
+      # Kept separate from `check` because the race detector needs a C
+      # toolchain, which not every developer machine has.
+      - name: Test with the race detector
+        run: make test-race

@@ -1,0 +1,15 @@
+# Build output
+/bin/
+/domieface-server
+/domieface-server.exe
+
+# Test coverage
+coverage.out
+
+# Local configuration — .env.example is the committed template
+.env
+.env.local
+
+# Editor and OS noise
+.DS_Store
+*.swp

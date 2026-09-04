@@ -1,0 +1,92 @@
+# Local development stack: the API, Postgres, and MinIO standing in for S3.
+#
+# Two ways to run this:
+#
+#   1. Dependencies only (recommended dev loop):
+#        docker compose up -d postgres minio minio-init
+#        go run .
+#      Everything resolves on localhost and no hosts file changes are needed.
+#
+#   2. Everything in Docker:
+#        docker compose up
+#      Presigned URLs are signed for the host in S3_ENDPOINT, and the signature
+#      covers that host, so it cannot be rewritten afterwards. For a client on
+#      your machine to follow those URLs, add this line to your hosts file:
+#        127.0.0.1  minio
+#      (/etc/hosts, or C:\Windows\System32\drivers\etc\hosts on Windows.)
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: domieface
+      POSTGRES_PASSWORD: domieface
+      POSTGRES_DB: domieface
+    ports:
+      # Override with POSTGRES_PORT if you already run Postgres on 5432.
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U domieface -d domieface"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # web console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Creates the bucket and makes it readable without credentials, because the
+  # API hands clients plain object URLs to render images from.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/domieface &&
+      mc anonymous set download local/domieface
+      "
+
+  api:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: 8080
+      ENVIRONMENT: development
+      DATABASE_URL: postgres://domieface:domieface@postgres:5432/domieface?sslmode=disable
+      JWT_SECRET: insecure-development-secret-do-not-use-in-production
+      S3_ENDPOINT: http://minio:9000
+      S3_REGION: us-east-1
+      S3_BUCKET: domieface
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin
+      S3_USE_PATH_STYLE: "true"
+      # Must be reachable from the client device, not just from this container.
+      S3_PUBLIC_BASE_URL: http://minio:9000/domieface
+
+volumes:
+  postgres-data:
+  minio-data:

@@ -1,0 +1,11 @@
+.git
+.github
+.qodo
+.env
+*.md
+!HANDOFF.md
+bin/
+domieface-server
+domieface-server.exe
+coverage.out
+Makefile

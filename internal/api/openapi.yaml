@@ -1,0 +1,970 @@
+openapi: 3.1.0
+
+info:
+  title: Social API
+  version: "1.0.0"
+  summary: Image posts with a global chronological feed.
+  description: |
+    Implementation of the contract in `HANDOFF.md`.
+
+    ### Conventions
+
+    - JSON only, `camelCase` in every request and response body.
+    - Timestamps are ISO 8601 UTC with exactly three fractional digits:
+      `2026-09-04T11:23:00.000Z`.
+    - IDs and page cursors are **opaque strings**. Never parse, sort, or do
+      arithmetic on them; pass a cursor back exactly as it was received.
+    - Successful responses return the resource directly. The only envelope is on
+      paginated lists, which return `{ items, nextCursor }`.
+    - User-facing copy is British English.
+
+    ### Authentication
+
+    Two tokens. The access token lasts 15 minutes and is sent on every protected
+    request as `Authorization: Bearer <accessToken>`. The refresh token lasts 30
+    days and is only ever sent to `/v1/auth/refresh`.
+
+    Refresh tokens **rotate**: every call to `/v1/auth/refresh` returns a new
+    refresh token and invalidates the one presented. Persist the new one
+    immediately. Presenting an already-used refresh token is treated as a leak
+    and revokes every token descended from that login.
+
+    ### Images
+
+    Image bytes never pass through this API. Ask for a presigned URL, `PUT` the
+    bytes straight to object storage with **no `Authorization` header of ours**,
+    then send the returned `key` back on the resource. See
+    `POST /v1/uploads/presign`.
+
+servers:
+  # Relative, so "Try it out" always calls whichever host and port served this
+  # document. Hardcoding a port here is wrong the moment PORT is not 8080.
+  - url: /
+    description: This server
+  - url: https://api.example.com
+    description: Production
+
+tags:
+  - name: Authentication
+    description: Registration, login, token rotation and logout.
+  - name: Users
+    description: The authenticated user's profile, and other users' public profiles.
+  - name: Posts
+    description: The global feed and individual posts.
+  - name: Uploads
+    description: Presigned URLs for uploading images to object storage.
+  - name: Operations
+    description: Liveness and readiness, for orchestrators. Unversioned and unauthenticated.
+
+# Every operation requires a bearer token unless it overrides this with
+# `security: []`.
+security:
+  - bearerAuth: []
+
+paths:
+  /v1/auth/register:
+    post:
+      tags: [Authentication]
+      summary: Create an account
+      operationId: register
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RegisterRequest" }
+      responses:
+        "201":
+          description: Account created and signed in.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthResponse" }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "409":
+          description: The email address or username is already in use.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                error:
+                  code: CONFLICT
+                  message: That username is already taken.
+                  details: { username: already taken }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /v1/auth/login:
+    post:
+      tags: [Authentication]
+      summary: Sign in
+      operationId: login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LoginRequest" }
+      responses:
+        "200":
+          description: Signed in.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthResponse" }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "401":
+          description: |
+            Wrong email or password. The two are deliberately indistinguishable,
+            so this response cannot be used to discover which emails are
+            registered.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                error:
+                  code: INVALID_CREDENTIALS
+                  message: Incorrect email or password.
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /v1/auth/refresh:
+    post:
+      tags: [Authentication]
+      summary: Exchange a refresh token for a new pair
+      operationId: refresh
+      security: []
+      description: |
+        Public, because the refresh token is itself the credential.
+
+        This rotates: the response carries a **new** refresh token and the one
+        you sent is now spent. Persist the new one before doing anything else.
+
+        Refresh must be single-flight on the client. If several requests get a
+        401 at once, queue them behind one refresh call — a second call using
+        the already-rotated token will fail and revoke the whole session.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RefreshTokenRequest" }
+      responses:
+        "200":
+          description: A new access and refresh token pair.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthResponse" }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "401":
+          description: |
+            The refresh token is unknown, expired, already used, or revoked.
+            There is nothing left to refresh with: clear both tokens and send the
+            user to the sign-in screen.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                error:
+                  code: TOKEN_INVALID
+                  message: Your session is no longer valid. Please sign in again.
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /v1/auth/logout:
+    post:
+      tags: [Authentication]
+      summary: End the session
+      operationId: logout
+      description: |
+        Revokes the refresh token and every token descended from the same login.
+
+        Idempotent: an unknown or already-revoked token still returns 204. Clear
+        both tokens client-side regardless of what this returns.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RefreshTokenRequest" }
+      responses:
+        "204": { description: Signed out. }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /v1/users/me:
+    get:
+      tags: [Users]
+      summary: Get the authenticated user
+      operationId: getMe
+      description: |
+        The full private profile, including `email`.
+
+        Call this on app launch when a refresh token exists — it is the "is my
+        session still good" check.
+      responses:
+        "200":
+          description: The authenticated user.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+    patch:
+      tags: [Users]
+      summary: Update the authenticated user
+      operationId: updateMe
+      description: |
+        Partial update — send only the fields that changed. An omitted field is
+        left alone.
+
+        `username` is immutable after registration and is not accepted here.
+
+        `avatarKey` has three meanings, and they are distinct:
+
+        | Body | Effect |
+        |---|---|
+        | key absent | avatar unchanged |
+        | `"avatarKey": null` | avatar removed |
+        | `"avatarKey": "uploads/…"` | avatar set to that upload |
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateMeRequest" }
+      responses:
+        "200":
+          description: The updated user.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/UploadForbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /v1/users/{username}:
+    get:
+      tags: [Users]
+      summary: Get a user's public profile
+      operationId: getUser
+      parameters:
+        - $ref: "#/components/parameters/Username"
+      responses:
+        "200":
+          description: The user's public profile. Never includes `email`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PublicUser" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /v1/users/{username}/posts:
+    get:
+      tags: [Posts]
+      summary: List one user's posts
+      operationId: listUserPosts
+      description: Same shape as the feed, scoped to a single user's grid.
+      parameters:
+        - $ref: "#/components/parameters/Username"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: A page of that user's posts, newest first.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaginatedPosts" }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /v1/uploads/presign:
+    post:
+      tags: [Uploads]
+      summary: Get a presigned upload URL
+      operationId: presignUpload
+      description: |
+        Step 1 of 3. The full flow:
+
+        ```
+        1. POST /v1/uploads/presign  -> { uploadUrl, key, expiresAt }
+        2. PUT  <uploadUrl>          -> the raw file bytes
+        3. PATCH /v1/users/me        -> { "avatarKey": key }
+           or POST /v1/posts         -> { "imageKey": key }
+        ```
+
+        **Step 2 goes to a third party.** Do not attach this API's
+        `Authorization` header to it, and do not send it through the client that
+        handles token refresh — it will break.
+
+        `Content-Type` and `Content-Length` are part of the signature, so the
+        `PUT` must send exactly the values declared here or storage rejects it.
+        Compress and resize first, then measure, then presign.
+
+        The URL expires in 15 minutes. Upload immediately; do not cache it.
+
+        A key that is never attached to a resource is collected after 24 hours,
+        so an abandoned upload is harmless.
+
+        ### Constraints
+
+        | | Avatar | Post image |
+        |---|---|---|
+        | Max size | 5 MB | 10 MB |
+        | Types | `image/jpeg`, `image/png`, `image/webp` | same |
+        | Min dimensions | 200 x 200 | 320 x 320 |
+
+        Minimum dimensions are **not enforced by this API** — the bytes never
+        reach it. Check them on the device.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PresignRequest" }
+      responses:
+        "200":
+          description: Upload to `uploadUrl`, then send `key` back on the resource.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PresignResponse" }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "413":
+          description: The declared size exceeds the limit for this purpose.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                error:
+                  code: FILE_TOO_LARGE
+                  message: That image is too large. The limit for an avatar is 5 MB.
+        "415":
+          description: The content type is not an allowed image format.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                error:
+                  code: UNSUPPORTED_MEDIA_TYPE
+                  message: "Images must be one of: image/jpeg, image/png, image/webp."
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /v1/posts:
+    get:
+      tags: [Posts]
+      summary: The feed
+      operationId: listPosts
+      description: |
+        Global and chronological, newest first. There is no personalisation.
+
+        Paged by opaque cursor rather than page number, deliberately: new posts
+        arrive at the top constantly, and offset paging would duplicate or skip
+        items mid-scroll. `nextCursor` is `null` on the last page.
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: A page of posts, newest first.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PaginatedPosts" }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+    post:
+      tags: [Posts]
+      summary: Create a post
+      operationId: createPost
+      description: |
+        Every post has exactly one image, so `imageKey` is required and must come
+        from a `purpose: "post"` presign made by you. A key can only be attached
+        once.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreatePostRequest" }
+      responses:
+        "201":
+          description: The created post.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Post" }
+        "400": { $ref: "#/components/responses/ValidationFailed" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/UploadForbidden" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /v1/posts/{id}:
+    get:
+      tags: [Posts]
+      summary: Get one post
+      operationId: getPost
+      parameters:
+        - $ref: "#/components/parameters/PostID"
+      responses:
+        "200":
+          description: The post.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Post" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+    delete:
+      tags: [Posts]
+      summary: Delete a post
+      operationId: deletePost
+      description: There is no edit. Delete and repost instead.
+      parameters:
+        - $ref: "#/components/parameters/PostID"
+      responses:
+        "204": { description: Deleted. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: The post is not yours.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                error:
+                  code: FORBIDDEN
+                  message: You can only delete your own posts.
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /healthz:
+    get:
+      tags: [Operations]
+      summary: Liveness
+      operationId: health
+      security: []
+      description: |
+        Answers as long as the process is up, and deliberately touches no
+        dependency. Liveness answers "is this process wedged, should you restart
+        it". Failing it during a database blip would have the orchestrator kill
+        healthy instances and turn a recoverable outage into a restart storm --
+        that question belongs to `/readyz`.
+
+        Always 200. There is no failure body: if the process cannot answer, it
+        does not answer.
+      responses:
+        "200":
+          description: The process is running.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+              example:
+                status: ok
+                service: domieface-server
+                version: 1.4.0
+                revision: 9f2c1ab4de70
+                goVersion: "1.26.0"
+                environment: production
+                time: "2026-09-04T11:23:00.000Z"
+                uptimeSeconds: 86400
+
+  /readyz:
+    get:
+      tags: [Operations]
+      summary: Readiness
+      operationId: ready
+      security: []
+      description: |
+        Reports whether dependencies are reachable, so a rolling deploy does not
+        send traffic to an instance that cannot serve it.
+      responses:
+        "200":
+          description: Every dependency answered. Route traffic here.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Readiness" }
+              example:
+                status: ok
+                service: domieface-server
+                version: 1.4.0
+                revision: 9f2c1ab4de70
+                goVersion: "1.26.0"
+                environment: production
+                time: "2026-09-04T11:23:00.000Z"
+                uptimeSeconds: 86400
+                checks:
+                  - { name: database, status: ok, latencyMs: 3 }
+        "503":
+          description: |
+            A dependency failed. Do not route traffic here. `checks` names the
+            one at fault.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Readiness" }
+              example:
+                status: degraded
+                service: domieface-server
+                version: 1.4.0
+                revision: 9f2c1ab4de70
+                goVersion: "1.26.0"
+                environment: production
+                time: "2026-09-04T11:23:00.000Z"
+                uptimeSeconds: 86400
+                checks:
+                  - { name: database, status: degraded, latencyMs: 2001, error: unreachable }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        The `accessToken` from register, login or refresh, sent as
+        `Authorization: Bearer <accessToken>`. Valid for 15 minutes.
+
+        A 401 carries one of two codes, and they mean different things:
+        `TOKEN_EXPIRED` means refresh and retry the request once;
+        `TOKEN_INVALID` means log the user out.
+
+  parameters:
+    Username:
+      name: username
+      in: path
+      required: true
+      description: The user's immutable handle.
+      schema: { $ref: "#/components/schemas/Username" }
+      example: ada
+
+    PostID:
+      name: id
+      in: path
+      required: true
+      description: Opaque post identifier.
+      schema: { type: string }
+      example: djbaalwbrctr35h4bmtjjald5y
+
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: |
+        The `nextCursor` from the previous page. Omit for the first page. Opaque
+        — pass it back verbatim and never construct one.
+      schema: { type: string }
+
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Page size. Values above the maximum are clamped, not rejected.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 50
+        default: 20
+
+  responses:
+    ValidationFailed:
+      description: |
+        The body failed validation. `details` maps each rejected field to a
+        reason; use it to drive inline form errors.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error:
+              code: VALIDATION_FAILED
+              message: Please check the highlighted fields.
+              details:
+                username: may only contain lowercase letters, numbers and underscores
+                password: must be at least 8 characters
+
+    Unauthorized:
+      description: |
+        The access token is missing, malformed, expired or revoked. Branch on
+        `code`: `TOKEN_EXPIRED` means refresh and retry once, `TOKEN_INVALID`
+        means log the user out.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            expired:
+              summary: Refresh and retry the request once
+              value:
+                error:
+                  code: TOKEN_EXPIRED
+                  message: Your session has expired. Please sign in again.
+            invalid:
+              summary: Log the user out
+              value:
+                error:
+                  code: TOKEN_INVALID
+                  message: Your session is no longer valid. Please sign in again.
+
+    UploadForbidden:
+      description: |
+        The upload key cannot be used here: it belongs to another user, was
+        presigned for a different purpose, or has already been attached to
+        something. Which of the three is not disclosed.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error:
+              code: FORBIDDEN
+              message: That upload cannot be used here.
+
+    NotFound:
+      description: The resource does not exist.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error:
+              code: NOT_FOUND
+              message: We could not find that post.
+
+    RateLimited:
+      description: Too many requests. Back off and honour `Retry-After`.
+      headers:
+        Retry-After:
+          description: Whole seconds to wait before retrying.
+          schema: { type: integer, minimum: 1 }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error:
+              code: RATE_LIMITED
+              message: Too many requests. Please try again shortly.
+
+    InternalError:
+      description: |
+        Something failed on the server. Show a generic message and log the rest;
+        the response deliberately carries no internal detail.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error:
+              code: INTERNAL_ERROR
+              message: Something went wrong on our end. Please try again.
+
+  schemas:
+    Timestamp:
+      type: string
+      format: date-time
+      description: ISO 8601 UTC with exactly three fractional digits.
+      pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$'
+      examples: ["2026-09-04T11:23:00.000Z"]
+
+    Username:
+      type: string
+      minLength: 3
+      maxLength: 30
+      pattern: "^[a-z0-9_]+$"
+      description: Lowercase letters, digits and underscores. Immutable after registration.
+      examples: [ada]
+
+    UploadKey:
+      type: string
+      description: The `key` returned by `POST /v1/uploads/presign`.
+      examples: ["uploads/a1b2c3d4e5f6a7b8c9d0e1f2/post.jpg"]
+
+    Error:
+      type: object
+      description: |
+        The shape of every failure. `message` is safe to show to the user;
+        `code` never is.
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              description: Stable identifier to branch on. Never render this.
+              enum:
+                - VALIDATION_FAILED
+                - INVALID_CREDENTIALS
+                - TOKEN_EXPIRED
+                - TOKEN_INVALID
+                - FORBIDDEN
+                - NOT_FOUND
+                - CONFLICT
+                - FILE_TOO_LARGE
+                - UNSUPPORTED_MEDIA_TYPE
+                - RATE_LIMITED
+                - INTERNAL_ERROR
+            message:
+              type: string
+              description: User-facing British English. Safe to display.
+            details:
+              type: object
+              description: Field name to reason. Present on validation and conflict failures.
+              additionalProperties: { type: string }
+          required: [code, message]
+      required: [error]
+
+    User:
+      type: object
+      description: The full private profile. Only ever returned to its owner.
+      properties:
+        id: { type: string, examples: [djbaalwbrctr35h4bmtjjald5y] }
+        email: { type: string, format: email, maxLength: 254, examples: ["ada@example.com"] }
+        username: { $ref: "#/components/schemas/Username" }
+        displayName: { type: string, minLength: 1, maxLength: 50, examples: [Ada Lovelace] }
+        bio: { type: string, maxLength: 160, examples: ["Building things."] }
+        avatarUrl:
+          type: [string, "null"]
+          format: uri
+          description: Null when the user has no avatar.
+        createdAt: { $ref: "#/components/schemas/Timestamp" }
+      required: [id, email, username, displayName, bio, avatarUrl, createdAt]
+
+    PublicUser:
+      type: object
+      description: Every other user, and every post author. Never carries `email`.
+      properties:
+        id: { type: string }
+        username: { $ref: "#/components/schemas/Username" }
+        displayName: { type: string, minLength: 1, maxLength: 50 }
+        bio: { type: string, maxLength: 160 }
+        avatarUrl:
+          type: [string, "null"]
+          format: uri
+        createdAt: { $ref: "#/components/schemas/Timestamp" }
+      required: [id, username, displayName, bio, avatarUrl, createdAt]
+
+    Post:
+      type: object
+      properties:
+        id: { type: string }
+        author: { $ref: "#/components/schemas/PublicUser" }
+        imageUrl:
+          type: string
+          format: uri
+          description: Where to render the image from. The storage key is internal and not exposed.
+        caption: { type: string, maxLength: 2200, description: Empty string when there is no caption. }
+        createdAt: { $ref: "#/components/schemas/Timestamp" }
+      required: [id, author, imageUrl, caption, createdAt]
+
+    PaginatedPosts:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Post" }
+          description: Always an array. Empty rather than null when there is nothing.
+        nextCursor:
+          type: [string, "null"]
+          description: Pass to `cursor` for the next page. Null on the last page.
+      required: [items, nextCursor]
+
+    AuthResponse:
+      type: object
+      description: |
+        Returned by register, login and refresh. Carries the user so no follow-up
+        request is needed, and the access token expiry so the client can refresh
+        before a request fails rather than after.
+      properties:
+        accessToken:
+          type: string
+          description: "Send as `Authorization: Bearer …`. Hold in memory only."
+        refreshToken:
+          type: string
+          description: |
+            Store in secure device storage, never in plain async storage. Replaced
+            on every refresh — persist the new one immediately.
+        accessTokenExpiresAt: { $ref: "#/components/schemas/Timestamp" }
+        user: { $ref: "#/components/schemas/User" }
+      required: [accessToken, refreshToken, accessTokenExpiresAt, user]
+
+    RegisterRequest:
+      type: object
+      properties:
+        email: { type: string, format: email, maxLength: 254, description: Stored lowercase. }
+        username: { $ref: "#/components/schemas/Username" }
+        displayName: { type: string, minLength: 1, maxLength: 50 }
+        password:
+          type: string
+          minLength: 8
+          maxLength: 128
+          description: Length is the only rule; there are deliberately no composition requirements.
+      required: [email, username, displayName, password]
+      example:
+        email: ada@example.com
+        username: ada
+        displayName: Ada Lovelace
+        password: correct-horse-battery
+
+    LoginRequest:
+      type: object
+      properties:
+        email: { type: string, format: email }
+        password: { type: string }
+      required: [email, password]
+      example:
+        email: ada@example.com
+        password: correct-horse-battery
+
+    RefreshTokenRequest:
+      type: object
+      properties:
+        refreshToken: { type: string }
+      required: [refreshToken]
+
+    UpdateMeRequest:
+      type: object
+      description: Send only the fields that changed. `username` is not accepted.
+      properties:
+        displayName: { type: string, minLength: 1, maxLength: 50 }
+        bio:
+          type: [string, "null"]
+          maxLength: 160
+          description: Null clears the bio.
+        avatarKey:
+          oneOf:
+            - $ref: "#/components/schemas/UploadKey"
+            - type: "null"
+          description: |
+            A key from a `purpose: "avatar"` presign. Null removes the avatar.
+            Omit to leave it unchanged.
+      example:
+        displayName: Ada L.
+        bio: Building things.
+        avatarKey: uploads/a1b2c3d4e5f6a7b8c9d0e1f2/avatar.jpg
+
+    CreatePostRequest:
+      type: object
+      properties:
+        imageKey: { $ref: "#/components/schemas/UploadKey" }
+        caption: { type: string, maxLength: 2200 }
+      required: [imageKey]
+      example:
+        imageKey: uploads/a1b2c3d4e5f6a7b8c9d0e1f2/post.jpg
+        caption: Sunset from the office.
+
+    PresignRequest:
+      type: object
+      properties:
+        contentType:
+          type: string
+          enum: [image/jpeg, image/png, image/webp]
+        contentLength:
+          type: integer
+          minimum: 1
+          description: |
+            Exact byte length of what you will upload. It is part of the
+            signature, so a mismatched `PUT` is rejected by storage.
+        purpose:
+          type: string
+          enum: [avatar, post]
+          description: Decides the size limit and what the key may be attached to.
+      required: [contentType, contentLength, purpose]
+      example:
+        contentType: image/jpeg
+        contentLength: 843201
+        purpose: avatar
+
+    PresignResponse:
+      type: object
+      properties:
+        uploadUrl:
+          type: string
+          format: uri
+          description: |
+            PUT the raw bytes here. Third-party host — send no `Authorization`
+            header of ours.
+        key: { $ref: "#/components/schemas/UploadKey" }
+        expiresAt: { $ref: "#/components/schemas/Timestamp" }
+      required: [uploadUrl, key, expiresAt]
+
+    Health:
+      type: object
+      description: |
+        What both health endpoints return. More than a status word on purpose:
+        during an incident these are the fields you want without shelling into
+        the box -- which build is running, and how long it has been up. An
+        `uptimeSeconds` that keeps resetting means the process is crash-looping.
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        service:
+          type: string
+          description: Identifies this service where several report to one dashboard.
+          examples: [domieface-server]
+        version:
+          type: string
+          description: |
+            The release stamped at build time, falling back to the VCS revision,
+            and to `dev` for a local build.
+          examples: ["1.4.0"]
+        revision:
+          type: string
+          description: |
+            Short VCS revision, with `-dirty` appended when the working tree had
+            uncommitted changes. Absent when not built from a repository.
+          examples: [9f2c1ab4de70]
+        goVersion:
+          type: string
+          examples: ["1.26.0"]
+        environment:
+          type: string
+          examples: [production, development]
+        time: { $ref: "#/components/schemas/Timestamp" }
+        uptimeSeconds:
+          type: integer
+          minimum: 0
+      required: [status, service, version, goVersion, environment, time, uptimeSeconds]
+
+    HealthCheck:
+      type: object
+      description: One dependency's verdict.
+      properties:
+        name:
+          type: string
+          examples: [database]
+        status:
+          type: string
+          enum: [ok, degraded]
+        latencyMs:
+          type: integer
+          minimum: 0
+          description: |
+            How long the check took. Worth watching on its own: a check that
+            passes in 1900ms is a dependency about to start failing.
+        error:
+          type: string
+          description: |
+            Why the check failed, omitted when it passed. These endpoints are
+            unauthenticated, so this says what failed, not where.
+          examples: [unreachable]
+      required: [name, status, latencyMs]
+
+    Readiness:
+      description: |
+        Everything in `Health`, plus per-dependency results.
+
+        Object storage is deliberately not among the checks. Uploads need it but
+        every read path does not, so a storage blip should not pull the whole
+        instance out of rotation.
+      allOf:
+        - $ref: "#/components/schemas/Health"
+        - type: object
+          properties:
+            checks:
+              type: array
+              items: { $ref: "#/components/schemas/HealthCheck" }
+          required: [checks]
