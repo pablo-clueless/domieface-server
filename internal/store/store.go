@@ -62,13 +62,13 @@ type Credentials struct {
 	PasswordHash string
 }
 
-// Post is one image with an optional caption. Author is always populated on
-// read so the feed needs no second query.
+// Post is a caption with an optional image. Author is always populated on read
+// so the feed needs no second query.
 type Post struct {
 	ID        string
 	AuthorID  string
 	Author    *User
-	ImageKey  string
+	ImageKey  *string
 	Caption   string
 	CreatedAt time.Time
 }
@@ -76,7 +76,7 @@ type Post struct {
 // NewPost is the input to post creation.
 type NewPost struct {
 	AuthorID string
-	ImageKey string
+	ImageKey *string
 	Caption  string
 }
 

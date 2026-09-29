@@ -199,6 +199,18 @@ func (e *env) createPost(a account, caption string) string {
 	return str(body["id"])
 }
 
+func (e *env) createTextPost(a account, caption string) string {
+	e.t.Helper()
+
+	res, body := e.do(http.MethodPost, "/v1/posts", a.accessToken, map[string]any{
+		"caption": caption,
+	})
+	if res.StatusCode != http.StatusCreated {
+		e.t.Fatalf("create text post: got %d, body %v", res.StatusCode, body)
+	}
+	return str(body["id"])
+}
+
 func str(v any) string {
 	s, _ := v.(string)
 	return s
@@ -656,16 +668,18 @@ func TestPresignConstraints(t *testing.T) {
 	})
 }
 
-func TestCreatePostRequiresAnImageKey(t *testing.T) {
+func TestCreatePostAllowsMissingImageKey(t *testing.T) {
 	e := newEnv(t)
 	ada := e.register("ada")
 
 	res, body := e.do(http.MethodPost, "/v1/posts", ada.accessToken, map[string]any{
 		"caption": "No image attached.",
 	})
-	envelope := assertError(t, res, body, http.StatusBadRequest, httpx.CodeValidationFailed)
-	if details(t, envelope)["imageKey"] == nil {
-		t.Error("details should name imageKey")
+	if res.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201 (body %v)", res.StatusCode, body)
+	}
+	if body["imageUrl"] != nil {
+		t.Errorf("imageUrl: got %v, want null when no image is attached", body["imageUrl"])
 	}
 }
 
@@ -706,6 +720,21 @@ func TestPostResponseShape(t *testing.T) {
 	}
 	if _, present := author["email"]; present {
 		t.Error("the post author leaked an email address")
+	}
+}
+
+func TestTextOnlyPostResponseShape(t *testing.T) {
+	e := newEnv(t)
+	ada := e.register("ada")
+	postID := e.createTextPost(ada, "Just words.")
+
+	_, body := e.do(http.MethodGet, "/v1/posts/"+postID, ada.accessToken, nil)
+
+	if body["imageUrl"] != nil {
+		t.Errorf("imageUrl: got %v, want null for a text-only post", body["imageUrl"])
+	}
+	if got := str(body["caption"]); got != "Just words." {
+		t.Errorf("caption: got %q, want %q", got, "Just words.")
 	}
 }
 

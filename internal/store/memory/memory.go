@@ -161,9 +161,12 @@ func (s *postStore) Create(_ context.Context, in store.NewPost) (*store.Post, er
 	post := &store.Post{
 		ID:        store.NewID(),
 		AuthorID:  in.AuthorID,
-		ImageKey:  in.ImageKey,
 		Caption:   in.Caption,
 		CreatedAt: time.Now().UTC(),
+	}
+	if in.ImageKey != nil {
+		key := *in.ImageKey
+		post.ImageKey = &key
 	}
 	s.posts[post.ID] = post
 
@@ -261,6 +264,10 @@ func (s *postStore) page(req store.PageRequest, keep func(*store.Post) bool) (*s
 
 func hydrate(p *store.Post, author *store.User) *store.Post {
 	clone := *p
+	if p.ImageKey != nil {
+		key := *p.ImageKey
+		clone.ImageKey = &key
+	}
 	clone.Author = copyUser(author)
 	return &clone
 }

@@ -1,11 +1,21 @@
 # Render blueprint. Create the service from this with Blueprints > New, or use
 # it as a checklist if you configured the service by hand in the dashboard.
 #
+# This file is the deployed equivalent of a .env: it is where configuration
+# lives for Render. A .env or .env.local cannot do that job, for three separate
+# reasons -- they are gitignored so Render never receives them, .dockerignore
+# keeps them out of the image, and the server reads real environment variables
+# rather than parsing a file. Only the Makefile reads .env, and only locally.
+#
+# Everything here is committed except entries marked "sync: false", which are
+# typed once into the Render dashboard. Keep credentials in that group.
+#
 # Two variables below are the ones that actually bite:
 #
 #   DATABASE_URL        Without it the server fails at boot. It no longer falls
 #                       back to localhost, so the error names the variable
 #                       instead of reporting "connection refused" at 127.0.0.1.
+#                       Use Neon's direct connection string, not the pooled one.
 #
 #   TRUST_PROXY_HEADER  Must be true here. Every request arrives through
 #                       Render's proxy, so without it the rate limiter sees one
@@ -31,10 +41,10 @@ services:
       - key: ENVIRONMENT
         value: production
 
+      # Paste Neon's DIRECT connection string here (not the -pooler one -- see
+      # DEPLOY.md). Marked sync: false because it contains the password.
       - key: DATABASE_URL
-        fromDatabase:
-          name: domieface-db
-          property: connectionString
+        sync: false
 
       # Render generates this once and keeps it. Rotating it signs out every
       # user, because it invalidates every access token in flight.
@@ -46,17 +56,17 @@ services:
       - key: TRUST_PROXY_HEADER
         value: "true"
 
+      # --- Object storage -------------------------------------------------
       # Render has no object storage, so these point at S3, Cloudflare R2,
-      # Backblaze B2 or similar. sync: false means "set in the dashboard, do not
-      # commit". The server refuses to start without them rather than failing
-      # later on the first upload.
+      # Backblaze B2 or similar.
+      #
+      # Only the two keys below are secret. Replace the sync: false entries for
+      # bucket, region, endpoint and public URL with plain values once you have
+      # picked a provider -- they are not credentials, and having them in this
+      # file is better than in a dashboard nobody can diff.
       - key: S3_BUCKET
         sync: false
       - key: S3_REGION
-        sync: false
-      - key: S3_ACCESS_KEY_ID
-        sync: false
-      - key: S3_SECRET_ACCESS_KEY
         sync: false
       # Where images are read back from. Must be reachable from the phone, not
       # just from this service.
@@ -66,6 +76,38 @@ services:
       # Leave unset for real AWS S3.
       - key: S3_ENDPOINT
         sync: false
+      # Path-style addressing is a MinIO/R2 workaround. Real S3 wants it off.
+      - key: S3_USE_PATH_STYLE
+        value: "false"
+
+      # The only two real secrets you type by hand. sync: false keeps them out
+      # of this file and out of git.
+      - key: S3_ACCESS_KEY_ID
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false
+
+      # --- Tuning -----------------------------------------------------------
+      # Not secret, so they live here rather than in a dashboard: this file is
+      # reviewable, diffable, and rolls back with the rest of the deploy.
+      - key: ACCESS_TOKEN_TTL
+        value: 15m
+      - key: REFRESH_TOKEN_TTL
+        value: 720h
+      - key: PRESIGN_TTL
+        value: 15m
+      - key: UPLOAD_GC_AFTER
+        value: 24h
+      - key: DOCS_ENABLED
+        value: "true"
+      - key: RATE_LIMIT_PER_MIN
+        value: "120"
+      - key: RATE_LIMIT_BURST
+        value: "40"
+      - key: AUTH_RATE_LIMIT_PER_MIN
+        value: "20"
+      - key: AUTH_RATE_LIMIT_BURST
+        value: "10"
 
       # The keep-alive defaults to RENDER_EXTERNAL_URL, which Render injects, so
       # the request leaves and re-enters through the router. See the README on
@@ -73,16 +115,16 @@ services:
       # guarantee on the free plan.
       - key: SELF_PING_ENABLED
         value: "true"
+      - key: SELF_PING_INTERVAL
+        value: 10m
 
-databases:
-  - name: domieface-db
-    plan: free
-    databaseName: domieface
-    user: domieface
-
+# No `databases:` block on purpose. Postgres and object storage are external --
+# Neon and Cloudflare R2 on their free tiers -- so this blueprint creates only
+# the web service. DEPLOY.md has the click-by-click for both.
+#
 # Free plan caveats, so they are not a surprise later:
 #
-#   - A free web service sleeps after ~15 minutes without inbound traffic, and
-#     the first request afterwards waits for a cold start.
-#   - A free Postgres instance is deleted after 30 days. Move to a paid plan
-#     before you have data you care about.
+#   - This web service sleeps after ~15 minutes without inbound traffic, and the
+#     first request afterwards waits for a cold start.
+#   - Neon's free database also autosuspends when idle. It wakes on the first
+#     query, so the effect is one slow request, not an error.

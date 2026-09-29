@@ -35,7 +35,7 @@ type publicUserResponse struct {
 type postResponse struct {
 	ID        string             `json:"id"`
 	Author    publicUserResponse `json:"author"`
-	ImageURL  string             `json:"imageUrl"`
+	ImageURL  *string            `json:"imageUrl"`
 	Caption   string             `json:"caption"`
 	CreatedAt jsontime.Time      `json:"createdAt"`
 }
@@ -77,6 +77,14 @@ func (s *Server) avatarURL(key *string) *string {
 	return &url
 }
 
+func (s *Server) imageURL(key *string) *string {
+	if key == nil || *key == "" {
+		return nil
+	}
+	url := s.presigner.PublicURL(*key)
+	return &url
+}
+
 func (s *Server) toUser(u *store.User) userResponse {
 	return userResponse{
 		ID:          u.ID,
@@ -104,7 +112,7 @@ func (s *Server) toPost(p *store.Post) postResponse {
 	return postResponse{
 		ID:        p.ID,
 		Author:    s.toPublicUser(p.Author),
-		ImageURL:  s.presigner.PublicURL(p.ImageKey),
+		ImageURL:  s.imageURL(p.ImageKey),
 		Caption:   p.Caption,
 		CreatedAt: jsontime.New(p.CreatedAt),
 	}

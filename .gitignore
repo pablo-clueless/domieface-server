@@ -13,3 +13,6 @@ coverage.out
 # Editor and OS noise
 .DS_Store
 *.swp
+
+# Docs
+DEPLOY.md

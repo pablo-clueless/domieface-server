@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"domieface/com/internal/httpx"
 	"domieface/com/internal/store"
@@ -12,8 +13,8 @@ import (
 )
 
 type createPostRequest struct {
-	ImageKey string `json:"imageKey"`
-	Caption  string `json:"caption"`
+	ImageKey *string `json:"imageKey"`
+	Caption  string  `json:"caption"`
 }
 
 // handleFeed implements GET /v1/posts — the global chronological feed.
@@ -32,8 +33,8 @@ func (s *Server) handleFeed(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// handleCreatePost implements POST /v1/posts. Every post has exactly one image,
-// so imageKey is required.
+// handleCreatePost implements POST /v1/posts. imageKey is optional; when
+// present it must come from a post-purpose presign made by the caller.
 func (s *Server) handleCreatePost(w http.ResponseWriter, r *http.Request) error {
 	me := currentUser(r.Context())
 
@@ -43,8 +44,12 @@ func (s *Server) handleCreatePost(w http.ResponseWriter, r *http.Request) error 
 	}
 
 	var errs validate.Errors
-	if req.ImageKey == "" {
-		errs.Add("imageKey", "is required")
+	var imageKey *string
+	if req.ImageKey != nil {
+		key := strings.TrimSpace(*req.ImageKey)
+		if key != "" {
+			imageKey = &key
+		}
 	}
 	caption := validate.Caption(&errs, "caption", req.Caption)
 
@@ -52,15 +57,18 @@ func (s *Server) handleCreatePost(w http.ResponseWriter, r *http.Request) error 
 		return httpx.ErrValidation("Please check the highlighted fields.", errs)
 	}
 
-	// Claim before insert: if the key is not the caller's, or was presigned as
-	// an avatar, or has already been used, no post is created.
-	if err := s.claimUpload(r, req.ImageKey, uploads.PurposePost); err != nil {
-		return err
+	if imageKey != nil {
+		// Claim before insert: if the key is not the caller's, or was
+		// presigned as an avatar, or has already been used, no post is
+		// created.
+		if err := s.claimUpload(r, *imageKey, uploads.PurposePost); err != nil {
+			return err
+		}
 	}
 
 	post, err := s.store.Posts().Create(r.Context(), store.NewPost{
 		AuthorID: me.ID,
-		ImageKey: req.ImageKey,
+		ImageKey: imageKey,
 		Caption:  caption,
 	})
 	if err != nil {
