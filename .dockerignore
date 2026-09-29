@@ -1,7 +1,11 @@
 .git
 .github
 .qodo
+# Every env file, not just .env. These hold real credentials and must never be
+# baked into an image: anyone who can pull it can read them, and they survive in
+# the layer history even if a later step deletes the file.
 .env
+.env.*
 *.md
 !HANDOFF.md
 bin/

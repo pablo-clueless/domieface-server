@@ -1,0 +1,2 @@
+ALTER TABLE posts
+    ALTER COLUMN image_key DROP NOT NULL;

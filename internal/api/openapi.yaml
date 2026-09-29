@@ -3,7 +3,7 @@ openapi: 3.1.0
 info:
   title: Social API
   version: "1.0.0"
-  summary: Image posts with a global chronological feed.
+  summary: Social posts with an optional image and a global chronological feed.
   description: |
     Implementation of the contract in `HANDOFF.md`.
 
@@ -386,9 +386,8 @@ paths:
       summary: Create a post
       operationId: createPost
       description: |
-        Every post has exactly one image, so `imageKey` is required and must come
-        from a `purpose: "post"` presign made by you. A key can only be attached
-        once.
+        `imageKey` is optional. When present, it must come from a
+        `purpose: "post"` presign made by you. A key can only be attached once.
       requestBody:
         required: true
         content:
@@ -752,9 +751,9 @@ components:
         id: { type: string }
         author: { $ref: "#/components/schemas/PublicUser" }
         imageUrl:
-          type: string
+          type: [string, "null"]
           format: uri
-          description: Where to render the image from. The storage key is internal and not exposed.
+          description: Null when the post has no image. The storage key is internal and not exposed.
         caption: { type: string, maxLength: 2200, description: Empty string when there is no caption. }
         createdAt: { $ref: "#/components/schemas/Timestamp" }
       required: [id, author, imageUrl, caption, createdAt]
@@ -848,11 +847,15 @@ components:
     CreatePostRequest:
       type: object
       properties:
-        imageKey: { $ref: "#/components/schemas/UploadKey" }
+        imageKey:
+          oneOf:
+            - $ref: "#/components/schemas/UploadKey"
+            - type: "null"
+          description: |
+            Optional key from a `purpose: "post"` presign. Omit or send null to
+            create a text-only post.
         caption: { type: string, maxLength: 2200 }
-      required: [imageKey]
       example:
-        imageKey: uploads/a1b2c3d4e5f6a7b8c9d0e1f2/post.jpg
         caption: Sunset from the office.
 
     PresignRequest:

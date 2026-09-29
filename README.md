@@ -192,8 +192,9 @@ SELF_PING_URL=https://your-service.example.com/healthz
 
 ## Deploying
 
-[render.yaml](render.yaml) is a Render blueprint covering the whole stack. Deploying
-anywhere else needs the same variables.
+**[DEPLOY.md](DEPLOY.md) is the click-by-click guide** — Neon for Postgres and
+Cloudflare R2 for images, both free, with [render.yaml](render.yaml) carrying
+everything that is not a credential. Deploying anywhere else needs the same variables.
 
 **`ENVIRONMENT` defaults to `production`, and only the exact string `development`
 unlocks the local fallbacks.** That direction is deliberate. The fallbacks include a
@@ -228,6 +229,23 @@ so a database blip will not have the platform recycle otherwise-healthy instance
 
 On the free plan: the web service sleeps after ~15 minutes without inbound traffic, and
 the Postgres instance is deleted after 30 days.
+
+### Env files vs. deployed configuration
+
+`.env` is a **local development** convenience and cannot configure a deployment.
+Three separate things stop it, and removing any one of them would not be enough:
+
+1. It is gitignored, so Render never receives it.
+2. `.dockerignore` excludes `.env*`, so it is not in the image — deliberately.
+   Credentials baked into an image are readable by anyone who can pull it, and
+   they survive in the layer history even if a later step deletes the file.
+3. The server reads real environment variables. Nothing in the binary parses a
+   `.env` file. Only the Makefile reads one, with `-include .env`, and only to
+   drive local `make` targets.
+
+[render.yaml](render.yaml) is the deployed equivalent: committed, reviewable, and
+it rolls back with the rest of the deploy. Everything non-secret lives there;
+only credentials are marked `sync: false` and typed once into the dashboard.
 
 ## Configuration
 
