@@ -340,12 +340,15 @@ another.
    not the keys — the key is an internal handle, and moving storage hosts later should not
    be a client change.
 
-3. **Minimum image dimensions cannot be enforced here.** The contract sets 200×200 for
-   avatars and 320×320 for post images, but the bytes go straight to object storage, so
-   this server never sees the image. Size and MIME type *are* enforced, via the presigned
-   signature. Dimensions are client-side only. If they need to be guaranteed, the options
-   are a storage event that inspects and rejects after the fact, or routing uploads
-   through the API — which the contract explicitly rules out.
+3. **Image contents are checked at attach time, not upload time.** The bytes go straight
+   to object storage, so the server only sees them once the client sends the key on
+   `POST /posts` or `PATCH /users/me`. At that point it reads the object's header from
+   storage (a few KB, never a full pixel decode). It rejects a key with nothing uploaded
+   (`VALIDATION_FAILED`), a file that isn't really the JPEG, PNG or WebP it was presigned
+   as (`UNSUPPORTED_MEDIA_TYPE`), and images below 200×200 for avatars or 320×320 for
+   posts (`VALIDATION_FAILED`). The check runs before the key is claimed, so a rejected
+   key can be retried. Only the header is verified: a valid header followed by corrupt
+   pixel data still passes.
 
 4. **`POST /auth/logout` is protected but takes the refresh token in the body.** Implemented
    as written. It revokes the whole family, and is idempotent: an unknown or empty token

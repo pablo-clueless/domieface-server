@@ -25,9 +25,26 @@ import (
 
 // fakePresigner stands in for object storage. Handler tests care about which
 // key gets attached to which resource, not about talking to a bucket.
-type fakePresigner struct{}
+//
+// Every key inspects as a valid 1024x1024 JPEG unless a test overrides it in
+// objects. A nil entry means nothing was uploaded for that key.
+type fakePresigner struct {
+	objects map[string]*uploads.ImageInfo
+}
 
-func (fakePresigner) Presign(_ context.Context, purpose uploads.Purpose, _ string, _ int64) (*uploads.Presigned, error) {
+func (f *fakePresigner) Inspect(_ context.Context, key string) (*uploads.ImageInfo, error) {
+	info, overridden := f.objects[key]
+	switch {
+	case !overridden:
+		return &uploads.ImageInfo{DeclaredType: "image/jpeg", ActualType: "image/jpeg", Width: 1024, Height: 1024}, nil
+	case info == nil:
+		return nil, uploads.ErrObjectMissing
+	default:
+		return info, nil
+	}
+}
+
+func (*fakePresigner) Presign(_ context.Context, purpose uploads.Purpose, _ string, _ int64) (*uploads.Presigned, error) {
 	key := fmt.Sprintf("uploads/%s/%s.jpg", store.NewID(), purpose)
 	return &uploads.Presigned{
 		UploadURL: "https://storage.test/" + key + "?signature=stub",
@@ -36,15 +53,16 @@ func (fakePresigner) Presign(_ context.Context, purpose uploads.Purpose, _ strin
 	}, nil
 }
 
-func (fakePresigner) PublicURL(key string) string { return "https://cdn.test/" + key }
+func (*fakePresigner) PublicURL(key string) string { return "https://cdn.test/" + key }
 
 var testSecret = []byte("a-test-secret-that-is-long-enough-for-hs256")
 
 type env struct {
-	t      *testing.T
-	server *httptest.Server
-	store  *memory.Store
-	api    *api.Server
+	t         *testing.T
+	server    *httptest.Server
+	store     *memory.Store
+	api       *api.Server
+	presigner *fakePresigner
 }
 
 func newEnv(t *testing.T) *env { return newEnvWithDocs(t, true) }
@@ -87,12 +105,13 @@ func newEnvWith(t *testing.T, docsEnabled bool, st store.Store) *env {
 
 	issuer := auth.NewTokenIssuer(cfg.JWTSecret, cfg.AccessTokenTTL)
 	sessions := auth.NewService(st.Tokens(), issuer, cfg.RefreshTokenTTL)
-	apiServer := api.New(cfg, st, sessions, issuer, fakePresigner{})
+	presigner := &fakePresigner{objects: map[string]*uploads.ImageInfo{}}
+	apiServer := api.New(cfg, st, sessions, issuer, presigner)
 	server := httptest.NewServer(apiServer.Handler())
 	t.Cleanup(server.Close)
 
 	inMemory, _ := st.(*memory.Store)
-	return &env{t: t, server: server, store: inMemory, api: apiServer}
+	return &env{t: t, server: server, store: inMemory, api: apiServer, presigner: presigner}
 }
 
 // do issues a request and decodes the JSON body, if there is one.
@@ -607,6 +626,80 @@ func TestUploadKeyCannotBeReused(t *testing.T) {
 
 	second, secondBody := e.do(http.MethodPost, "/v1/posts", ada.accessToken, map[string]any{"imageKey": key})
 	assertError(t, second, secondBody, http.StatusForbidden, httpx.CodeForbidden)
+}
+
+// Attaching a key is the first time the server looks at the bytes, so that is
+// where existence, real format and minimum dimensions are enforced. A rejected
+// key must stay unclaimed so the client is not told it was "already used".
+func TestAttachInspectsTheUploadedImage(t *testing.T) {
+	cases := []struct {
+		name       string
+		purpose    string
+		object     *uploads.ImageInfo
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name:       "nothing uploaded",
+			purpose:    "post",
+			object:     nil,
+			wantStatus: http.StatusBadRequest,
+			wantCode:   httpx.CodeValidationFailed,
+		},
+		{
+			name:       "not an image",
+			purpose:    "post",
+			object:     &uploads.ImageInfo{DeclaredType: "image/png"},
+			wantStatus: http.StatusUnsupportedMediaType,
+			wantCode:   httpx.CodeUnsupportedMediaType,
+		},
+		{
+			name:       "declared PNG, actually JPEG",
+			purpose:    "post",
+			object:     &uploads.ImageInfo{DeclaredType: "image/png", ActualType: "image/jpeg", Width: 800, Height: 800},
+			wantStatus: http.StatusUnsupportedMediaType,
+			wantCode:   httpx.CodeUnsupportedMediaType,
+		},
+		{
+			name:       "post below 320px",
+			purpose:    "post",
+			object:     &uploads.ImageInfo{DeclaredType: "image/jpeg", ActualType: "image/jpeg", Width: 319, Height: 800},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   httpx.CodeValidationFailed,
+		},
+		{
+			name:       "avatar below 200px",
+			purpose:    "avatar",
+			object:     &uploads.ImageInfo{DeclaredType: "image/webp", ActualType: "image/webp", Width: 200, Height: 199},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   httpx.CodeValidationFailed,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			ada := e.register("ada")
+			key := e.presign(ada, tc.purpose)
+			e.presigner.objects[key] = tc.object
+
+			attach := func() (*http.Response, map[string]any) {
+				if tc.purpose == "avatar" {
+					return e.do(http.MethodPatch, "/v1/users/me", ada.accessToken, map[string]any{"avatarKey": key})
+				}
+				return e.do(http.MethodPost, "/v1/posts", ada.accessToken, map[string]any{"imageKey": key})
+			}
+
+			res, body := attach()
+			assertError(t, res, body, tc.wantStatus, tc.wantCode)
+
+			// Once a valid file is in place, the same key still attaches.
+			delete(e.presigner.objects, key)
+			if res, body := attach(); res.StatusCode >= 300 {
+				t.Fatalf("retry after fixing the object: got %d, body %v", res.StatusCode, body)
+			}
+		})
+	}
 }
 
 func TestPresignConstraints(t *testing.T) {
