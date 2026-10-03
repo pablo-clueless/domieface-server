@@ -2,7 +2,9 @@ package api
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"domieface/com/internal/httpx"
@@ -146,7 +148,16 @@ func (s *Server) userByUsername(r *http.Request) (*store.User, error) {
 
 // claimUpload attaches a presigned key to the caller, translating the store's
 // ownership verdict into contract error codes.
+//
+// The object is inspected first. Storage only checked that the PUT headers
+// matched the signature; this is the first time anyone looks at the bytes. It
+// runs before the claim so a failed check leaves the key unclaimed, and a
+// transient storage error does not burn a perfectly good upload.
 func (s *Server) claimUpload(r *http.Request, key string, purpose uploads.Purpose) error {
+	if err := s.inspectUpload(r, key, purpose); err != nil {
+		return err
+	}
+
 	err := s.store.Uploads().Claim(r.Context(), key, currentUser(r.Context()).ID, string(purpose), time.Now())
 	switch {
 	case err == nil:
@@ -159,6 +170,37 @@ func (s *Server) claimUpload(r *http.Request, key string, purpose uploads.Purpos
 		// already attached. All three are the caller's problem, and saying
 		// which would leak whether a given key exists.
 		return httpx.ErrForbidden("That upload cannot be used here.")
+	default:
+		return httpx.ErrInternal(err)
+	}
+}
+
+// inspectUpload checks that the object behind key exists, really is the image
+// type it was presigned as, and meets the purpose's minimum dimensions.
+func (s *Server) inspectUpload(r *http.Request, key string, purpose uploads.Purpose) error {
+	field := keyFieldFor(purpose)
+
+	info, err := s.presigner.Inspect(r.Context(), key)
+	if err == nil {
+		err = uploads.Check(purpose, info)
+	}
+
+	limits := uploads.ConstraintsFor(purpose)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, uploads.ErrObjectMissing):
+		return httpx.ErrValidation("That image has not finished uploading. Upload it, then try again.",
+			validate.Errors{field: "no file has been uploaded for this key"})
+	case errors.Is(err, uploads.ErrNotAnImage), errors.Is(err, uploads.ErrTypeMismatch):
+		return httpx.ErrUnsupportedMediaType(fmt.Sprintf(
+			"That file is not a valid image. Images must be one of: %s.",
+			strings.Join(uploads.AllowedContentTypes(), ", ")))
+	case errors.Is(err, uploads.ErrTooSmall):
+		return httpx.ErrValidation(fmt.Sprintf(
+			"That image is too small. It must be at least %dx%d pixels for a %s.",
+			limits.MinWidth, limits.MinHeight, purpose),
+			validate.Errors{field: fmt.Sprintf("image is %dx%d", info.Width, info.Height)})
 	default:
 		return httpx.ErrInternal(err)
 	}

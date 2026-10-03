@@ -12,4 +12,5 @@ import (
 type Presigner interface {
 	Presign(ctx context.Context, purpose uploads.Purpose, contentType string, contentLength int64) (*uploads.Presigned, error)
 	PublicURL(key string) string
+	Inspect(ctx context.Context, key string) (*uploads.ImageInfo, error)
 }

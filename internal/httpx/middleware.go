@@ -48,6 +48,32 @@ func WithRequestID(next http.Handler) http.Handler {
 	})
 }
 
+// WithCORS allows browsers on any origin to call the API. Auth travels in the
+// Authorization header rather than cookies, so a wildcard origin is safe.
+// Preflight requests are answered here so they never reach the mux, which has
+// no OPTIONS routes.
+func WithCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Access-Control-Allow-Origin", "*")
+		h.Set("Access-Control-Expose-Headers", "X-Request-Id, Retry-After")
+
+		if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+			h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+			if reqHeaders := r.Header.Get("Access-Control-Request-Headers"); reqHeaders != "" {
+				h.Set("Access-Control-Allow-Headers", reqHeaders)
+			} else {
+				h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Request-Id")
+			}
+			h.Set("Access-Control-Max-Age", "86400")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 // statusRecorder captures the status code so the logger can report it.
 type statusRecorder struct {
 	http.ResponseWriter

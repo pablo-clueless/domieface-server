@@ -130,6 +130,7 @@ func (s *Server) Handler() http.Handler {
 		httpx.WithRequestID,
 		httpx.WithRecovery,
 		httpx.WithLogging,
+		httpx.WithCORS,
 		s.limiter.Middleware(s.clientKey),
 	)
 }

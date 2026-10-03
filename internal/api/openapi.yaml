@@ -241,6 +241,7 @@ paths:
         "400": { $ref: "#/components/responses/ValidationFailed" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/UploadForbidden" }
+        "415": { $ref: "#/components/responses/UploadNotAnImage" }
         "429": { $ref: "#/components/responses/RateLimited" }
         "500": { $ref: "#/components/responses/InternalError" }
 
@@ -320,8 +321,13 @@ paths:
         | Types | `image/jpeg`, `image/png`, `image/webp` | same |
         | Min dimensions | 200 x 200 | 320 x 320 |
 
-        Minimum dimensions are **not enforced by this API** — the bytes never
-        reach it. Check them on the device.
+        Size and type are enforced here and by the signature. The image itself
+        is checked when the key is **attached** (`POST /v1/posts`,
+        `PATCH /v1/users/me`): the file must have been uploaded, must really be
+        the declared format, and must meet the minimum dimensions. A key that
+        fails is left unattached, so the same key can be retried once a valid
+        file is in place. Check dimensions on the device too, to avoid a wasted
+        upload.
       requestBody:
         required: true
         content:
@@ -402,6 +408,7 @@ paths:
         "400": { $ref: "#/components/responses/ValidationFailed" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/UploadForbidden" }
+        "415": { $ref: "#/components/responses/UploadNotAnImage" }
         "429": { $ref: "#/components/responses/RateLimited" }
         "500": { $ref: "#/components/responses/InternalError" }
 
@@ -611,6 +618,17 @@ components:
                   code: TOKEN_INVALID
                   message: Your session is no longer valid. Please sign in again.
 
+    UploadNotAnImage:
+      description: |
+        The uploaded file is not a JPEG, PNG or WebP, or is a different format
+        from the content type it was presigned with.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error:
+              code: UNSUPPORTED_MEDIA_TYPE
+              message: "That file is not a valid image. Images must be one of: image/jpeg, image/png, image/webp."
     UploadForbidden:
       description: |
         The upload key cannot be used here: it belongs to another user, was

@@ -20,9 +20,9 @@ const (
 // Constraints are the per-purpose limits from section 4 of the contract.
 type Constraints struct {
 	MaxBytes int64
-	// MinWidth and MinHeight are documented for the client and are NOT
-	// enforced here: the bytes go straight to object storage, so this server
-	// never sees the image and cannot measure it. See README, "Known gaps".
+	// MinWidth and MinHeight cannot be checked at presign time, before any
+	// bytes exist. They are enforced when the key is attached: see Inspect
+	// and Check.
 	MinWidth  int
 	MinHeight int
 }
